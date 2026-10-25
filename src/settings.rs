@@ -143,15 +143,8 @@ fn draw(out: &mut impl Write, cfg: &PetConfig, selected: usize) -> io::Result<()
 /// The pane the picker maps onto: inner cell dimensions of the focused pane.
 fn pane_inner() -> Option<(i32, i32)> {
     let cur = socket::request("pane.current", json!({})).ok()?;
-    let pane_id = cur["pane"]["pane_id"].as_str()?;
-    let lay = socket::request("pane.layout", json!({ "pane_id": pane_id })).ok()?;
-    let rect = lay["layout"]["panes"]
-        .as_array()?
-        .iter()
-        .find(|p| p["pane_id"].as_str() == Some(pane_id))?;
-    let w = rect["rect"]["width"].as_i64()? as i32;
-    let h = rect["rect"]["height"].as_i64()? as i32;
-    Some(((w - 2).max(1), (h - 2).max(1)))
+    let ws = crate::tty::pane_size(cur["pane"]["pane_id"].as_str()?)?;
+    Some(((ws.cols as i32).max(1), (ws.rows as i32).max(1)))
 }
 
 /// The box on screen that represents the pane, sized to the popup.

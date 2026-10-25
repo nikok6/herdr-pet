@@ -1,6 +1,6 @@
 [package]
 name = "herdr-pet"
-version = "0.1.2"
+version = "0.2.0"
 edition = "2021"
 license = "MIT"
 description = "Codex-style animated pet floating over herdr agent panes"
@@ -20,6 +20,7 @@ signal-hook = "0.3"
 toml = "0.8"
 crossterm = "0.29"
 libc = "0.2"
+base64 = "0.22"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = "0.10"

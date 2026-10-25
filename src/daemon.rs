@@ -1,16 +1,14 @@
-//! The pet daemon: one kitty-graphics layer per target pane, animated from
-//! herdr agent status events. Single-threaded event loop over an mpsc channel
-//! fed by socket reader threads, the signal thread, and the drag tap.
+//! The pet daemon: one pet image per target pane, drawn through the pane's own
+//! terminal output and animated from herdr agent status events. Single-threaded
+//! event loop over an mpsc channel fed by socket reader threads, the signal
+//! thread, and the drag tap.
 use crate::config::{Mode, PetConfig};
-use crate::socket::{self, GraphicsStream, Placement};
+use crate::socket;
 use crate::sprites::{self, Pet, Row, CELL_H, CELL_W};
+use crate::tty::{OpenError, PaneTty, WinSize};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
-
-/// Process-wide so a late `StreamClosed` for a recreated pane cannot match a new stream.
-static STREAM_GEN: AtomicU64 = AtomicU64::new(0);
 use std::time::{Duration, Instant};
 
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
@@ -20,7 +18,6 @@ pub enum Msg {
     EventsClosed(Option<String>),
     /// Pushed event from the per-pane status subscription (generation-tagged).
     StatusClosed(u64),
-    StreamClosed { pane_id: String, gen: u64, reason: Option<String> },
     ReloadConfig,
     /// A background pet load finished (tagged with the load generation that requested it).
     PetLoaded { gen: u64, result: Result<(Option<Pet>, Grid), String> },
@@ -79,13 +76,11 @@ impl Status {
     }
 }
 
-/// What `pane.graphics.info` told us about the host and the herdr version.
+/// Host cell size in pixels; the pet's width in cells follows from it.
 #[derive(Debug, Clone, Copy)]
 pub struct Cell {
     pub width_px: u32,
     pub height_px: u32,
-    /// herdr ≥ 0.8: `pane.graphics.info` reports `pane_visible`, and panes have named layers.
-    pub modern: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -162,10 +157,33 @@ impl PaneInfo {
     }
 }
 
+/// Where the pet is drawn inside a pane, in cells from the pane's top-left.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct Placement {
+    col: i32,
+    row: i32,
+    cols: u32,
+    rows: u32,
+}
+
+/// Default: bottom-right corner with a one-cell margin, or the configured/dragged
+/// cell; always inside the pane.
+fn placement_for(shared: &Shared, drag: (i32, i32), ws: WinSize) -> Placement {
+    let (inner_w, inner_h) = (ws.cols as i32, ws.rows as i32);
+    let (cols, rows) = (shared.grid.cols as i32, shared.grid.rows as i32);
+    let [base_col, base_row] = shared.cfg.position.unwrap_or([inner_w - cols - 1, inner_h - rows - 1]);
+    Placement {
+        col: (base_col + drag.0).clamp(0, (inner_w - cols).max(0)),
+        row: (base_row + drag.1).clamp(0, (inner_h - rows).max(0)),
+        cols: shared.grid.cols,
+        rows: shared.grid.rows,
+    }
+}
+
 struct PetInstance {
     pane_id: String,
-    stream: Option<GraphicsStream>,
-    stream_gen: u64,
+    /// The pane's pty while attached; frames are written to it.
+    tty: Option<PaneTty>,
     retry_at: Option<Instant>,
     row: Row,
     frame: usize,
@@ -173,30 +191,42 @@ struct PetInstance {
     /// Row that plays once before returning to `base`.
     one_shot: Option<Row>,
     base: Row,
+    /// Where the last frame was drawn.
     placement: Placement,
+    /// A frame is on screen at `placement`.
+    drawn: bool,
     /// Live drag displacement in cells; folded into margins on release.
     drag: (i32, i32),
-    inner: (i32, i32),
-    /// False until a pane rect is known; nothing is sent before that.
+    /// False until the pane is known to be on screen; nothing is sent before that.
     placed: bool,
     /// herdr reported the pane id as unknown; the daemon removes the instance.
     gone: bool,
     status: Status,
-    /// In the active tab of the focused workspace; otherwise just keep the layer alive.
+    /// In the active tab of the focused workspace; otherwise nothing is drawn.
     visible: bool,
     /// Loop the animation (vs. hold a static frame that only changes with status).
     animated: bool,
     last_focus: Instant,
 }
 
-const KEEPALIVE: Duration = Duration::from_secs(4);
+/// Standing still, the pet is redrawn this often so it keeps its spot while the pane scrolls.
+const KEEPALIVE: Duration = Duration::from_secs(2);
+
+impl Drop for PetInstance {
+    /// herdr cannot know who owns an image a pane's output created, so the pet
+    /// takes itself off the screen when its instance goes away.
+    fn drop(&mut self) {
+        if let Some(tty) = self.tty.as_mut() {
+            tty.clear();
+        }
+    }
+}
 
 impl PetInstance {
     fn new(pane_id: String) -> PetInstance {
         PetInstance {
             pane_id,
-            stream: None,
-            stream_gen: 0,
+            tty: None,
             retry_at: None,
             row: Row::Idle,
             frame: 0,
@@ -204,8 +234,8 @@ impl PetInstance {
             one_shot: None,
             base: Row::Idle,
             placement: Placement::default(),
+            drawn: false,
             drag: (0, 0),
-            inner: (0, 0),
             placed: false,
             gone: false,
             status: Status::Unknown,
@@ -229,54 +259,39 @@ impl PetInstance {
         }
     }
 
-    fn start(&mut self, shared: &Shared, tx: &Sender<Msg>) {
+    fn start(&mut self, shared: &Shared) {
         if shared.cfg.transitions {
-            self.play(Row::Waving, Some(Row::Idle), shared, tx);
+            self.play(Row::Waving, Some(Row::Idle), shared);
         }
     }
 
-    fn attach(&mut self, tx: &Sender<Msg>) {
-        if self.stream.is_some() {
+    fn attach(&mut self) {
+        if self.tty.is_some() {
             return;
         }
-        if let Some(at) = self.retry_at {
-            if Instant::now() < at {
-                return;
-            }
+        if self.retry_at.is_some_and(|at| Instant::now() < at) {
+            return;
         }
-        self.stream_gen = STREAM_GEN.fetch_add(1, Ordering::Relaxed) + 1;
-        let (gen, pane_id, tx2) = (self.stream_gen, self.pane_id.clone(), tx.clone());
-        match GraphicsStream::open(&self.pane_id, move |reason| {
-            let _ = tx2.send(Msg::StreamClosed { pane_id, gen, reason });
-        }) {
-            Ok(stream) => {
-                self.stream = Some(stream);
+        match PaneTty::open(&self.pane_id) {
+            Ok(mut tty) => {
+                // A daemon that died without cleaning up may have left a frame behind.
+                tty.clear();
+                self.tty = Some(tty);
                 self.retry_at = None;
             }
             Err(e) => {
-                if e.code() == "pane_not_found" {
+                if matches!(e, OpenError::Gone) {
                     // The pane id no longer exists (closed, or moved to another
                     // workspace, which re-ids it without a pane_closed event).
                     self.gone = true;
                 }
-                log(format!("stream {} open failed: {e}", self.pane_id));
+                log(format!("pty {} open failed: {e}", self.pane_id));
                 self.retry_at = Some(Instant::now() + Duration::from_secs(2));
             }
         }
     }
 
-    fn on_stream_closed(&mut self, gen: u64, reason: Option<String>) {
-        if gen != self.stream_gen {
-            return;
-        }
-        if let Some(reason) = reason {
-            log(format!("stream {} closed: {reason}", self.pane_id));
-        }
-        self.stream = None;
-        self.retry_at = Some(Instant::now() + Duration::from_millis(500));
-    }
-
-    fn set_status(&mut self, status: Status, shared: &Shared, tx: &Sender<Msg>) {
+    fn set_status(&mut self, status: Status, shared: &Shared) {
         if status == self.status {
             return;
         }
@@ -285,33 +300,33 @@ impl PetInstance {
         let base = status.row();
         let transitions = shared.cfg.transitions;
         if transitions && status == Status::Done && prev != Status::Done {
-            self.play(Row::Jumping, Some(base), shared, tx);
+            self.play(Row::Jumping, Some(base), shared);
         } else if transitions && status == Status::Blocked && prev != Status::Blocked {
-            self.play(Row::Waving, Some(base), shared, tx);
+            self.play(Row::Waving, Some(base), shared);
         } else {
-            self.play(base, None, shared, tx);
+            self.play(base, None, shared);
         }
     }
 
     /// Drag in progress: face and "run" in the direction of travel (Codex/Orca behaviour).
-    fn set_drag_row(&mut self, row: Row, shared: &Shared, tx: &Sender<Msg>) {
+    fn set_drag_row(&mut self, row: Row, shared: &Shared) {
         if self.row != row {
-            self.play(row, None, shared, tx);
+            self.play(row, None, shared);
         }
     }
 
     /// Drag released: back to the row for the current agent status.
-    fn restore_status_row(&mut self, shared: &Shared, tx: &Sender<Msg>) {
+    fn restore_status_row(&mut self, shared: &Shared) {
         let base = self.status.row();
-        self.play(base, None, shared, tx);
+        self.play(base, None, shared);
     }
 
-    fn set_exited(&mut self, shared: &Shared, tx: &Sender<Msg>) {
+    fn set_exited(&mut self, shared: &Shared) {
         self.status = Status::Unknown;
-        self.play(Row::Failed, None, shared, tx);
+        self.play(Row::Failed, None, shared);
     }
 
-    fn play(&mut self, row: Row, then_base: Option<Row>, shared: &Shared, tx: &Sender<Msg>) {
+    fn play(&mut self, row: Row, then_base: Option<Row>, shared: &Shared) {
         // Static pets skip one-shots (they could never finish them) and jump to the base row.
         let (row, then_base) = if self.animated { (row, then_base) } else { (then_base.unwrap_or(row), None) };
         match then_base {
@@ -335,66 +350,74 @@ impl PetInstance {
             self.row = row;
             self.frame = 0;
             self.next_at = Instant::now() + frame_duration(durations(shared, row)[0], &shared.cfg);
-            self.send_frame(shared, tx);
+            self.send_frame(shared);
         }
     }
 
-    /// Pane rect from the tab layout (outer; the graphics area is the inner rect, borders excluded).
-    fn set_rect(&mut self, w: i32, h: i32, shared: &Shared, tx: &Sender<Msg>) {
-        self.inner = ((w - 2).max(1), (h - 2).max(1));
+    /// The pane is on screen: draw (or move) the pet.
+    fn set_placed(&mut self, shared: &Shared) {
         self.placed = true;
-        self.apply_placement(shared, tx);
+        self.apply_placement(shared);
     }
 
-    fn apply_placement(&mut self, shared: &Shared, tx: &Sender<Msg>) {
-        let (inner_w, inner_h) = self.inner;
-        let (cols, rows) = (shared.grid.cols as i32, shared.grid.rows as i32);
-        // Default: bottom-right corner with a one-cell margin; otherwise the dragged cell.
-        let [base_col, base_row] = shared.cfg.position.unwrap_or([inner_w - cols - 1, inner_h - rows - 1]);
-        let placement = Placement {
-            viewport_col: (base_col + self.drag.0).clamp(0, (inner_w - cols).max(0)),
-            viewport_row: (base_row + self.drag.1).clamp(0, (inner_h - rows).max(0)),
-            grid_cols: shared.grid.cols,
-            grid_rows: shared.grid.rows,
-        };
-        // Layout events fire continuously while a split is dragged; only re-send
-        // when something about the placement actually changed.
-        if placement == self.placement && self.stream.is_some() {
-            return;
+    fn apply_placement(&mut self, shared: &Shared) {
+        // Layout events fire continuously while a split is dragged; only redraw
+        // when the spot actually changed.
+        if self.drawn {
+            let ws = self.tty.as_ref().and_then(|t| t.winsize().ok());
+            if ws.is_some_and(|ws| placement_for(shared, self.drag, ws) == self.placement) {
+                return;
+            }
         }
-        self.placement = placement;
-        self.send_frame(shared, tx);
+        self.send_frame(shared);
     }
 
-    fn send_frame(&mut self, shared: &Shared, tx: &Sender<Msg>) {
+    fn send_frame(&mut self, shared: &Shared) {
         let Some(pet) = &shared.pet else { return };
-        if !self.placed {
+        if !self.placed || !self.visible {
             return;
         }
-        self.attach(tx);
-        let Some(stream) = self.stream.as_mut() else { return };
+        self.attach();
+        let Some(tty) = self.tty.as_mut() else { return };
+        let placement = match tty.winsize() {
+            Ok(ws) => placement_for(shared, self.drag, ws),
+            Err(e) => {
+                log(format!("pty {} size failed: {e}", self.pane_id));
+                self.tty = None;
+                self.drawn = false;
+                self.retry_at = Some(Instant::now() + Duration::from_millis(500));
+                return;
+            }
+        };
         let png = pet.frame(self.row, self.frame);
-        if let Err(e) = stream.frame(pet.width, pet.height, self.placement, png) {
-            log(format!("stream {} write failed: {e}", self.pane_id));
-            self.stream = None;
-            self.retry_at = Some(Instant::now() + Duration::from_millis(500));
+        match tty.draw(png, placement.col as u32, placement.row as u32, placement.cols, placement.rows) {
+            Ok(()) => {
+                self.placement = placement;
+                self.drawn = true;
+            }
+            Err(e) => {
+                log(format!("pty {} write failed: {e}", self.pane_id));
+                self.tty = None;
+                self.drawn = false;
+                self.retry_at = Some(Instant::now() + Duration::from_millis(500));
+            }
         }
     }
 
     /// Advance the animation when the current frame's duration has elapsed.
-    /// Hidden panes only get a stationary keep-alive frame (herdr closes a
-    /// stream that is silent for 5s).
-    fn tick(&mut self, now: Instant, shared: &Shared, tx: &Sender<Msg>) {
+    /// A pet that is hidden is left alone; one standing still is redrawn at its
+    /// spot now and then, because the pane's text may have scrolled under it.
+    fn tick(&mut self, now: Instant, shared: &Shared) {
         // A due re-attach must run even between frames, or the loop spins on it.
-        if self.stream.is_none() && self.retry_at.is_some_and(|at| now >= at) {
-            self.send_frame(shared, tx);
+        if self.tty.is_none() && self.retry_at.is_some_and(|at| now >= at) {
+            self.send_frame(shared);
         }
         if now < self.next_at {
             return;
         }
         if !self.visible || !self.animated {
             self.next_at = now + KEEPALIVE;
-            self.send_frame(shared, tx);
+            self.send_frame(shared);
             return;
         }
         let len = durations(shared, self.row).len();
@@ -407,21 +430,21 @@ impl PetInstance {
         }
         let holds = durations(shared, self.row);
         self.next_at = now + frame_duration(holds[self.frame % holds.len()], &shared.cfg);
-        self.send_frame(shared, tx);
+        self.send_frame(shared);
     }
 
-    fn drag_by(&mut self, dcols: i32, drows: i32, shared: &Shared, tx: &Sender<Msg>) {
+    fn drag_by(&mut self, dcols: i32, drows: i32, shared: &Shared) {
         self.drag.0 += dcols;
         self.drag.1 += drows;
-        self.apply_placement(shared, tx);
+        self.apply_placement(shared);
     }
 
     /// Drag released: persist the final cell as `position`.
-    fn drag_end(&mut self, shared: &mut Shared, tx: &Sender<Msg>) {
+    fn drag_end(&mut self, shared: &mut Shared) {
         let p = self.placement;
-        shared.cfg.position = Some([p.viewport_col, p.viewport_row]);
+        shared.cfg.position = Some([p.col, p.row]);
         self.drag = (0, 0);
-        self.apply_placement(shared, tx);
+        self.apply_placement(shared);
         // Persist onto the current file contents (the popover may have changed
         // other keys meanwhile); never write over a file that does not parse.
         match PetConfig::load() {
@@ -433,7 +456,7 @@ impl PetInstance {
             }
             Err(e) => log(format!("config: {e}; position not saved")),
         }
-        log(format!("{}: dragged to col {} row {}", self.pane_id, p.viewport_col, p.viewport_row));
+        log(format!("{}: dragged to col {} row {}", self.pane_id, p.col, p.row));
     }
 }
 
@@ -528,7 +551,7 @@ impl Daemon {
         for info in &panes {
             if !self.instances.contains_key(&info.pane_id) {
                 let mut inst = PetInstance::new(info.pane_id.clone());
-                inst.start(&self.shared, &self.tx);
+                inst.start(&self.shared);
                 self.instances.insert(info.pane_id.clone(), inst);
                 self.order.push(info.pane_id.clone());
             }
@@ -536,7 +559,7 @@ impl Daemon {
             if info.focused {
                 inst.last_focus = now;
             }
-            inst.set_status(info.status, &self.shared, &self.tx);
+            inst.set_status(info.status, &self.shared);
         }
         // `all` keeps a few recently focused panes warm (for instant switch-back);
         // `agents` keeps every agent pane.
@@ -558,19 +581,19 @@ impl Daemon {
         }
     }
 
-    /// One `pane.layout` for the focused pane's tab gives every visible pane's
-    /// rect: those instances get placed from it, everything else is hidden and
-    /// left alone (its placement is refreshed when it becomes visible again).
+    /// One `pane.layout` for the focused pane's tab says which panes are on
+    /// screen: those instances get drawn, everything else is hidden and left
+    /// alone (it is redrawn when it becomes visible again).
     fn refresh_visibility(&mut self) {
-        let mut rects: HashMap<String, (i32, i32)> = HashMap::new();
+        let mut on_screen: HashSet<String> = HashSet::new();
         if let Some(id) = &self.focused {
             match socket::request("pane.layout", json!({ "pane_id": id })) {
                 Ok(res) => {
+                    // A zoomed pane covers the rest of the tab.
+                    let zoomed = res["layout"]["zoomed"].as_bool().unwrap_or(false);
                     for p in res["layout"]["panes"].as_array().into_iter().flatten() {
-                        if let Some(pid) = p["pane_id"].as_str() {
-                            let w = p["rect"]["width"].as_i64().unwrap_or(0) as i32;
-                            let h = p["rect"]["height"].as_i64().unwrap_or(0) as i32;
-                            rects.insert(pid.to_owned(), (w, h));
+                        if let Some(pid) = p["pane_id"].as_str().filter(|pid| !zoomed || *pid == id) {
+                            on_screen.insert(pid.to_owned());
                         }
                     }
                 }
@@ -583,30 +606,19 @@ impl Daemon {
             }
         }
         // In `all` mode a warm pet must not linger next to the focused one: a pane
-        // that is visible but not focused loses its pet (re-showing it is ~5ms).
+        // that is visible but not focused loses its pet (re-showing it is cheap).
         if self.shared.cfg.mode == Mode::All {
             let focused = self.focused.clone();
-            self.instances.retain(|id, _| !rects.contains_key(id) || focused.as_deref() == Some(id.as_str()));
+            self.instances.retain(|id, _| !on_screen.contains(id) || focused.as_deref() == Some(id.as_str()));
             self.order.retain(|id| self.instances.contains_key(id));
         }
         for (id, inst) in self.instances.iter_mut() {
-            // Being in the focused tab's layout is the 0.7 approximation of "on
-            // screen"; herdr ≥ 0.8 knows for sure (zoom, hidden UI modes).
-            let mut visible = rects.contains_key(id);
-            if visible && self.shared.cell.modern {
-                if let Ok(info) = socket::request("pane.graphics.info", json!({ "pane_id": id })) {
-                    if let Some(v) = info["pane_visible"].as_bool() {
-                        visible = v;
-                    }
-                }
-            }
-            match rects.get(id).filter(|_| visible) {
-                Some(&(w, h)) => {
-                    let animated = self.focused.as_deref() == Some(id.as_str());
-                    inst.set_visible(true, animated);
-                    inst.set_rect(w, h, &self.shared, &self.tx);
-                }
-                None => inst.set_visible(false, false),
+            if on_screen.contains(id) {
+                let animated = self.focused.as_deref() == Some(id.as_str());
+                inst.set_visible(true, animated);
+                inst.set_placed(&self.shared);
+            } else {
+                inst.set_visible(false, false);
             }
         }
     }
@@ -659,13 +671,13 @@ impl Daemon {
             "pane_agent_status_changed" => {
                 let status = Status::parse(data["agent_status"].as_str().unwrap_or("unknown"));
                 match pane_id.and_then(|id| self.instances.get_mut(&id)) {
-                    Some(inst) => inst.set_status(status, &self.shared, &self.tx),
+                    Some(inst) => inst.set_status(status, &self.shared),
                     None => self.schedule_reconcile(),
                 }
             }
             "pane_exited" => {
                 if let Some(inst) = pane_id.and_then(|id| self.instances.get_mut(&id)) {
-                    inst.set_exited(&self.shared, &self.tx);
+                    inst.set_exited(&self.shared);
                 }
             }
             "pane_closed" => {
@@ -756,11 +768,6 @@ impl Daemon {
                     self.schedule_reconcile();
                 }
             }
-            Msg::StreamClosed { pane_id, gen, reason } => {
-                if let Some(inst) = self.instances.get_mut(&pane_id) {
-                    inst.on_stream_closed(gen, reason);
-                }
-            }
             Msg::ReloadConfig => match PetConfig::load() {
                 Ok(cfg) => self.apply_config(cfg),
                 Err(e) => log(format!("config: {e}; keeping current settings")),
@@ -817,7 +824,7 @@ impl Daemon {
                 if let Some(row) = dir {
                     self.drag_dir_acc = 0.0;
                     if let Some(inst) = self.instances.get_mut(&id) {
-                        inst.set_drag_row(row, &self.shared, &self.tx);
+                        inst.set_drag_row(row, &self.shared);
                     }
                 }
                 self.drag_acc.0 += dx;
@@ -828,15 +835,15 @@ impl Daemon {
                     self.drag_acc.0 -= dc as f64 * cell.width_px as f64;
                     self.drag_acc.1 -= dr as f64 * cell.height_px as f64;
                     if let Some(inst) = self.instances.get_mut(&id) {
-                        inst.drag_by(dc, dr, &self.shared, &self.tx);
+                        inst.drag_by(dc, dr, &self.shared);
                     }
                 }
             }
             Msg::DragEnd => {
                 if let Some(inst) = self.drag_target.take().and_then(|id| self.instances.remove(&id)) {
                     let mut inst = inst;
-                    inst.drag_end(&mut self.shared, &self.tx);
-                    inst.restore_status_row(&self.shared, &self.tx);
+                    inst.drag_end(&mut self.shared);
+                    inst.restore_status_row(&self.shared);
                     self.instances.insert(inst.pane_id.clone(), inst);
                 }
             }
@@ -874,7 +881,7 @@ impl Daemon {
                 self.reconcile();
             }
             for inst in self.instances.values_mut() {
-                inst.tick(now, &self.shared, &self.tx);
+                inst.tick(now, &self.shared);
             }
             if self.instances.values().any(|i| i.gone) {
                 self.instances.retain(|_, i| !i.gone);
@@ -889,7 +896,7 @@ impl Daemon {
                 }
             }
         }
-        // Dropping instances closes their streams; herdr clears the layers.
+        // Dropping instances takes their pets off the screen.
         self.instances.clear();
         self.status_sub = None;
     }
@@ -907,35 +914,43 @@ const EVENTS: &[&str] = &[
     "workspace.focused",
 ];
 
-/// herdr only knows the host cell size once a client started with
-/// `kitty_graphics = true` is attached, so keep polling instead of dying.
+/// Pixel size of one cell, as a pane's pty reports it (herdr sets it from the
+/// attached client, so every pane agrees). Unknown until a client with image
+/// support is attached; a pane resized by a bare API client may report zero.
+fn probe_cell_size() -> Result<(u32, u32), String> {
+    let res = socket::request("pane.list", json!({})).map_err(|e| format!("herdr unavailable ({e}); retrying"))?;
+    let mut panes: Vec<&Value> = res["panes"].as_array().into_iter().flatten().collect();
+    if panes.is_empty() {
+        return Err("no panes yet".to_owned());
+    }
+    // The focused pane first.
+    panes.sort_by_key(|p| !p["focused"].as_bool().unwrap_or(false));
+    let mut problem = None;
+    for id in panes.iter().filter_map(|p| p["pane_id"].as_str()) {
+        let ws = PaneTty::open(id).map_err(|e| e.to_string()).and_then(|tty| tty.winsize().map_err(|e| e.to_string()));
+        match ws {
+            Ok(ws) => {
+                if let Some(px) = ws.cell_px() {
+                    return Ok(px);
+                }
+            }
+            Err(e) => {
+                problem.get_or_insert(format!("cannot reach pane {id}'s terminal ({e}); retrying"));
+            }
+        }
+    }
+    Err(problem.unwrap_or_else(|| {
+        "herdr reports no cell pixel size yet: detach (prefix+q) and run `herdr` again from a terminal that draws images (Ghostty, kitty, WezTerm)".to_owned()
+    }))
+}
+
+/// Keep polling for the cell size instead of dying.
 fn wait_for_cell_size(rx: &Receiver<Msg>) -> Option<Cell> {
     let mut warned = String::new();
     loop {
-        let attempt = socket::request("pane.current", json!({}))
-            .and_then(|cur| socket::request("pane.graphics.info", json!({ "pane_id": cur["pane"]["pane_id"] })));
-        match attempt {
-            Ok(info) => {
-                let modern = info.get("pane_visible").is_some();
-                let layers = info["max_layers_per_pane"].as_u64().unwrap_or(1);
-                log(format!(
-                    "herdr graphics: {} (layers per pane: {layers}{})",
-                    if modern { "0.8+ api" } else { "0.7 api" },
-                    info["file_frame_transport"].as_str().map(|t| format!(", file frames: {t}")).unwrap_or_default()
-                ));
-                return Some(Cell {
-                    width_px: info["cell_width_px"].as_u64().unwrap_or(8) as u32,
-                    height_px: info["cell_height_px"].as_u64().unwrap_or(16) as u32,
-                    modern,
-                });
-            }
-            Err(e) => {
-                let hint = match e.code() {
-                    "feature_disabled" => "enable pane graphics: add `[experimental]` `kitty_graphics = true` to the herdr config, then `herdr server reload-config`".to_owned(),
-                    "cell_size_unavailable" => "herdr client has no cell pixel size yet: detach (prefix+q) and run `herdr` again so the client starts with kitty_graphics enabled".to_owned(),
-                    "not_found" | "pane_not_found" => "no focused pane yet".to_owned(),
-                    _ => format!("herdr unavailable ({e}); retrying"),
-                };
+        match probe_cell_size() {
+            Ok((width_px, height_px)) => return Some(Cell { width_px, height_px }),
+            Err(hint) => {
                 if hint != warned {
                     log(format!("waiting: {hint}"));
                     warned = hint;
@@ -1027,7 +1042,7 @@ mod tests {
     use super::*;
 
     fn cell(w: u32, h: u32) -> Cell {
-        Cell { width_px: w, height_px: h, modern: false }
+        Cell { width_px: w, height_px: h }
     }
 
     #[test]
@@ -1040,6 +1055,24 @@ mod tests {
         assert!(g.cols >= 2 && g.rows == 24);
         let g = grid_for(0, cell(8, 16));
         assert_eq!(g.rows, 2);
+    }
+
+    #[test]
+    fn pet_sits_in_the_corner_and_stays_inside_the_pane() {
+        let shared = Shared { pet: None, cfg: PetConfig::default(), grid: Grid { cols: 10, rows: 6 }, cell: cell(8, 16) };
+        let ws = |cols, rows| WinSize { cols, rows, width_px: cols * 8, height_px: rows * 16 };
+        // Bottom-right with a one-cell margin.
+        let p = placement_for(&shared, (0, 0), ws(100, 40));
+        assert_eq!((p.col, p.row, p.cols, p.rows), (89, 33, 10, 6));
+        // A drag past the edge is clamped; a pane smaller than the pet pins it to the origin.
+        let p = placement_for(&shared, (50, 50), ws(100, 40));
+        assert_eq!((p.col, p.row), (90, 34));
+        let p = placement_for(&shared, (0, 0), ws(4, 3));
+        assert_eq!((p.col, p.row), (0, 0));
+        // A configured position wins over the corner.
+        let shared = Shared { cfg: PetConfig { position: Some([5, 7]), ..PetConfig::default() }, ..shared };
+        let p = placement_for(&shared, (0, 0), ws(100, 40));
+        assert_eq!((p.col, p.row), (5, 7));
     }
 
     #[test]

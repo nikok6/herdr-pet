@@ -7,6 +7,7 @@ mod drag;
 mod settings;
 mod socket;
 mod sprites;
+mod tty;
 
 use config::{config_path, plugin_root, state_dir, PetConfig};
 use std::fs;
