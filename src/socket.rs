@@ -1,7 +1,7 @@
 //! NDJSON client for the herdr socket API over a Unix domain socket.
-//! One request per line; `events.subscribe` and `pane.graphics.stream` keep
-//! the connection open. Push-style connections get a reader thread that
-//! forwards lines through caller-supplied closures.
+//! One request per line; `events.subscribe` keeps the connection open.
+//! Push-style connections get a reader thread that forwards lines through
+//! caller-supplied closures.
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::fmt;
@@ -103,9 +103,6 @@ fn parse_response(line: &str) -> Result<Value, Error> {
 /// One-shot request on a fresh connection; returns the `result` object.
 /// Requests run on the daemon's event-loop thread, so they must never hang.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
-/// A frame write that stalls this long means herdr is not draining the stream;
-/// the daemon drops the stream and re-attaches later instead of freezing.
-const FRAME_WRITE_TIMEOUT: Duration = Duration::from_millis(500);
 
 pub fn request(method: &str, params: Value) -> Result<Value, Error> {
     let mut stream = connect()?;
@@ -120,8 +117,7 @@ pub fn request(method: &str, params: Value) -> Result<Value, Error> {
     parse_response(&line)
 }
 
-/// A push connection (subscription or graphics stream). Dropping/closing it
-/// ends the reader thread.
+/// A push connection (subscription). Dropping/closing it ends the reader thread.
 pub struct Connection {
     stream: UnixStream,
 }
@@ -209,61 +205,4 @@ fn read_ack(reader: &mut BufReader<UnixStream>) -> Result<String, Error> {
         return Err(Error::Closed);
     }
     Ok(line)
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
-pub struct Placement {
-    pub viewport_col: i32,
-    pub viewport_row: i32,
-    pub grid_cols: u32,
-    pub grid_rows: u32,
-}
-
-/// A `pane.graphics.stream` connection. After the `ok`, each frame is one JSON
-/// header line followed by exactly `data_length` raw bytes. The stream owns the
-/// pane's graphics layer until it closes; herdr clears the layer on close and
-/// only writes back on error (then closes).
-pub struct GraphicsStream {
-    conn: Connection,
-}
-
-/// Our layer on herdr ≥ 0.8 (up to 16 named layers per pane, ordered by z_index),
-/// so a pet can sit above another plugin's graphics. herdr 0.7 has one layer per
-/// pane and ignores these fields.
-pub const LAYER_ID: &str = "pet";
-pub const Z_INDEX: i32 = 100;
-
-impl GraphicsStream {
-    pub fn open(
-        pane_id: &str,
-        on_close: impl FnOnce(Option<String>) + Send + 'static,
-    ) -> Result<GraphicsStream, Error> {
-        let mut stream = connect()?;
-        stream.set_write_timeout(Some(REQUEST_TIMEOUT))?;
-        write_line(
-            &mut stream,
-            &json!({
-                "id": next_id("gfx"),
-                "method": "pane.graphics.stream",
-                "params": { "pane_id": pane_id, "layer_id": LAYER_ID, "z_index": Z_INDEX },
-            }),
-        )?;
-        let mut reader = BufReader::new(stream.try_clone()?);
-        parse_response(&read_ack(&mut reader)?)?;
-        stream.set_write_timeout(Some(FRAME_WRITE_TIMEOUT))?;
-        spawn_reader(reader, |_| {}, on_close);
-        Ok(GraphicsStream { conn: Connection { stream } })
-    }
-
-    pub fn frame(&mut self, width: u32, height: u32, placement: Placement, png: &[u8]) -> std::io::Result<()> {
-        let header = json!({
-            "format": "png",
-            "image_width": width,
-            "image_height": height,
-            "data_length": png.len(),
-            "placement": placement,
-        });
-        write_line(&mut self.conn.stream, &header)?;
-        self.conn.stream.write_all(png)
-    }
 }
